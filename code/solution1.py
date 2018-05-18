@@ -32,7 +32,8 @@ Created on Thu May 10 14:25:19 2018
 """
 from sklearn.model_selection import train_test_split
 from sklearn.metrics.pairwise import cosine_similarity
-
+from scipy import spatial
+# Model
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.ensemble import ExtraTreesClassifier
 from sklearn.ensemble import AdaBoostClassifier
@@ -43,7 +44,7 @@ from lightgbm import LGBMClassifier
 from sklearn.metrics import confusion_matrix
 from sklearn.neighbors import KNeighborsClassifier
 from sklearn.cluster import AgglomerativeClustering
-from sklearn.cluster import KMeans, DBSCAN
+from sklearn.cluster import KMeans, DBSCAN, MiniBatchKMeans
 from sklearn.metrics import roc_curve 
 from sklearn.preprocessing import StandardScaler, MinMaxScaler
 from sklearn.pipeline import make_pipeline, make_union, Pipeline
@@ -115,6 +116,70 @@ class KSampleSubset:
         self.X['y']  = self.y.values
         self.X['by'] = self.by.values
         
+    def sample_select(self, X, n_clusters) -> list:
+        """ 使用聚类的方式提取具有代表性的样本
+        
+        Input:
+        ------
+        X: 样本集
+        n_clusters: 聚类的数量
+        
+        Output:
+        ------
+        indexes: 选中的样本点在X中的索引
+        """
+        # 数据归一化处理
+        X_norm = self.sample_norm(X.copy(), n_type='MinMax')
+        
+        # 随机使用3/4的样本进行聚类
+        X_norm = X_norm[np.random.randint(len(X_norm), size=int(len(X_norm)*(3.0/4.0))),:] 
+        
+        # 进行Kmeans聚类
+        mbk = MiniBatchKMeans(n_clusters=n_clusters, init_size=n_clusters+1)
+        mbk.fit(X_norm)
+        
+        # 有了聚类中心后, 找出距离每个聚类中心最近的样本点, 返回索引
+        c_centers = mbk.cluster_centers_
+        
+        # 找距离聚类中心最近的点
+        kdtree = spatial.KDTree(X_norm)
+        _, indexes = kdtree.query(c_centers)
+                     
+        return indexes        
+    
+    
+    def fit_transform_v2(self, frac):
+        """ 
+        frac: 负样本数量与正样本数量之比
+        """
+        X, y = [], []
+        for name, group in self.X.groupby('by'):
+            """ 在每个分组中抽取一些正/负样本 """
+            # 本组下的正负样本
+            samples_pos = group[group['y'] == 1] # 此分组下的正样本
+            samples_neg = group[group['y'] == 0] # 此分组下的负样本
+            
+            # 正/负样本的数量
+            num_pos, num_neg = len(samples_pos), len(samples_neg)
+            
+            # 抽取一部分的正/负样本组成训练集
+            index_pos = np.random.randint(num_pos, size=int(num_pos))      # 抽取num_pos个正样本
+            index_neg = self.sample_select(X=samples_neg.iloc[:,:-2], n_clusters=int(num_pos*frac)) # 抽取num_pos*frac个负样本
+                        
+            # 抽取得到的正/负样本
+            samples_pos_selected = samples_pos.iloc[index_pos]
+            samples_neg_selected = samples_neg.iloc[index_neg]
+            
+            # 保存抽取到的本组内的正/负样本
+            X.append(samples_pos_selected)
+            y.append(np.ones((int(num_pos), 1)))
+            
+            X.append(samples_neg_selected)
+            y.append(np.zeros((int(num_pos*frac), 1)))
+            
+        return np.vstack(X)[:,:-2], np.squeeze(np.vstack(y)) 
+    
+    
     def fit_transform(self, frac):
         """ 
         frac: 负样本数量与正样本数量之比
@@ -144,8 +209,24 @@ class KSampleSubset:
             X.append(samples_neg_selected)
             y.append(np.zeros((int(num_pos*frac), 1)))
             
-        return np.vstack(X)[:,:-2], np.squeeze(np.vstack(y))
-
+        return np.vstack(X)[:,:-2], np.squeeze(np.vstack(y))        
+        
+    
+    def sample_norm(self, X: pd.DataFrame, n_type='MinMax') -> pd.DataFrame:
+        """ 对样本进行标准化处理(为了方便聚类算法)
+        """
+        if n_type == 'MinMax':
+            scaler = MinMaxScaler()
+            X = scaler.fit_transform(X)
+            
+        elif n_type == 'Standard':
+            scaler = StandardScaler()
+            X = scaler.fit_transform(X)
+        else:
+            return X
+        
+        return X
+    
     
 def sample_extraction2(X, y, frac, pos_index=1):
     """ 抽取正样本+负样本
@@ -262,12 +343,15 @@ if __name__ == '__main__':
         
         # 开始训练
         trained_models = []
-        for i in range(len(models)):
+        for i in tqdm(range(len(models))):
             print('Begin to train the', str(i), '-th classifier...')
             
             # 抽取训练样本集
-            kss = KSampleSubset(X=X_train, y=y_train, by=X_train_date)
-            X, y = kss.fit_transform(frac=4)
+            kss = KSampleSubset(X=X_train.copy(), y=y_train, by=X_train_date)
+            X, y = kss.fit_transform_v2(frac=3)
+            
+            # 保存下来
+            np.savez_compressed('../samples/samples_'+str(i), X=X, y=y)
             
             # 训练模型
             clf, eval_train.iloc[i,:], eval_test.iloc[i,:] = model_train(models[i], X, y)
@@ -292,10 +376,10 @@ if __name__ == '__main__':
             y_test_prob_final[i] = y_test_prob[index,i].mean()
         
         
+        
     with timer('Write Result'):
         result = pd.DataFrame()
         result['id']    = id_test
         result['score'] = y_test_prob_final
-        result.to_csv('../submission/submission_180516_v5.csv', index=False)
-
+        result.to_csv('../submission/submission_180517_v6.csv', index=False)
 
